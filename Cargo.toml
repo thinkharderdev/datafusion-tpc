@@ -1,0 +1,47 @@
+[package]
+name = "datafusion-tpc"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1.0.69"
+async-executor = "1.5.0"
+async-trait = "0.1.64"
+bytes = "1.4.0"
+core_affinity = "0.8.0"
+crossbeam-deque = "0.8.2"
+datafusion = { path = "../arrow-datafusion/datafusion/core", features = ["scheduler","jit"] }
+futures = "0.3.26"
+futures-lite = "1.12.0"
+futures-rustls = { version = "0.22.2", features = ["early-data"] }
+glommio = { version = "0.8.0", features = ["nightly", "native-tls"] }
+hyper = { version = "0.14.24", features = ["client", "h2", "http2"] }
+hyper-rustls = { version = "0.23.2", default-features = false, features = ["http2", "webpki-roots", "tokio-runtime"] }
+hyper-tls = "0.5.0"
+libc = "0.2.139"
+num_cpus = "1.15.0"
+object_store = "0.5.4"
+once_cell = { version = "1.17.1", features = ["parking_lot"] }
+rayon = "1.6.1"
+rustls = "0.20.8"
+tokio = "1.25.0"
+tokio-rustls = "0.23.4"
+tokio-uring = { version = "0.4.0", features = ["bytes"] }
+tracing = "0.1.37"
+tracing-subscriber = "0.3.16"
+url = "2.3.1"
+webpki = "0.22.0"
+webpki-roots = "0.22.6"
+
+[dev-dependencies]
+criterion = { version = "0.4.0", features = ["async_tokio"] }
+
+[[bench]]
+harness = false
+name = "query"
+
+[profile.bench]
+codegen-units = 1
+lto = true
