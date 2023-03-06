@@ -1,16 +1,33 @@
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use datafusion::common::DataFusionError;
 
-use datafusion::datasource::object_store::ObjectStoreRegistry;
+use datafusion::datasource::object_store::{ObjectStoreProvider, ObjectStoreRegistry};
 use datafusion::execution::runtime_env::{RuntimeConfig, RuntimeEnv};
-use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::{execute_stream, ExecutionPlan};
 use datafusion::prelude::*;
 use datafusion::scheduler::Scheduler;
-use datafusion_tpc::driver::IOUringDriver;
-use datafusion_tpc::object_store::file::AsyncFileStore;
-use futures::StreamExt;
+
+use futures_lite::StreamExt;
+use object_store::aws::{AmazonS3, AmazonS3Builder};
+use object_store::{ClientOptions, ObjectStore};
+use tracing::info;
+use url::Url;
+
+const AWS_REGION: &str = "eu-west-1";
+const AWS_ACCESS_KEY: &str = "";
+const AWS_SECRET: &str = "";
+const AWS_TOKEN: &str = "";
+const TABLE_PATH: &str = "s3://cgx-query-engine-bench-data/access-logs/";
+
+const QUERY: &[(&str,&str); 4] = &[
+    ("full_scan", "SELECT * FROM logs"),
+    ("filter", "SELECT service, pod FROM logs WHERE request_method = 'DELETE'"),
+    ("aggregation", "SELECT container, pod, AVG(response_bytes) AS avg_response_size FROM logs GROUP BY container, pod"),
+    ("limit", "SELECT container FROM logs LIMIT 1"),
+];
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -19,105 +36,95 @@ fn main() -> Result<()> {
         .with_max_level(tracing::Level::INFO)
         .init();
 
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
 
     rt.block_on(async {
-        let tpc_plan = create_plan("/home/ubuntu/data/tpc-1").await?;
-        let normal_plan = create_plan("/home/ubuntu/data/normal-1").await?;
+        let object_store_registry = ObjectStoreRegistry::new_with_provider(Some(Arc::new(
+            S3ObjectStoreProvider::new()
+        )));
 
-        execute_tpc_query(&tpc_plan).await?;
-        execute_query(&normal_plan).await?;
+        let runtime_config =
+            RuntimeConfig::default().with_object_store_registry(Arc::new(object_store_registry));
+
+        let runtime_env = Arc::new(RuntimeEnv::new(runtime_config)?);
+
+        let config = SessionConfig::new().with_target_partitions(6);
+        let ctx = SessionContext::with_config_rt(config, runtime_env);
+
+        let scheduler = Scheduler::new_thread_per_core();
+
+        ctx.register_parquet("logs", TABLE_PATH, ParquetReadOptions::default()).await?;
+
+        for (name, sql) in QUERY.iter() {
+            let plan = ctx.sql(*sql).await?.create_physical_plan().await?;
+
+            let mut stream = execute_stream(plan.clone(), ctx.task_ctx())?;
+
+            let start = Instant::now();
+
+            while let Some(batch) = stream.next().await {
+                let _ = batch?;
+            }
+
+            let elapsed = start.elapsed().as_secs_f64();
+            info!(elapsed, name, "standard");
+
+            let mut stream = scheduler.schedule(plan.clone(), ctx.task_ctx())?.stream();
+
+            let start = Instant::now();
+
+            while let Some(batch) = stream.next().await {
+                let _ = batch?;
+            }
+
+            let elapsed = start.elapsed().as_secs_f64();
+            info!(elapsed, name, "scheduled");
+        }
 
         Ok::<(), anyhow::Error>(())
     })?;
 
+
     Ok(())
 }
 
-async fn create_plan(path: &str) -> Result<Arc<dyn ExecutionPlan>> {
-    let config = SessionConfig::new().with_target_partitions(6);
-    let ctx = SessionContext::with_config(config);
-
-    let plan = ctx
-        .read_parquet(path, ParquetReadOptions::default().parquet_pruning(true))
-        .await?;
-    // .unwrap()
-    // .aggregate(
-    //     vec![col("service"), col("host")],
-    //     vec![avg(col("request_bytes"))],
-    // )
-
-    Ok(ctx
-        .state()
-        .create_physical_plan(plan.logical_plan())
-        .await?)
+struct S3ObjectStoreProvider {
+    region: String,
 }
 
-async fn execute_query(plan: &Arc<dyn ExecutionPlan>) -> Result<()> {
-    let config = SessionConfig::new().with_target_partitions(6);
-    let ctx = SessionContext::with_config(config);
-
-    let start = Instant::now();
-
-    for i in 0..30 {
-        let plan = plan.clone();
-        let start = Instant::now();
-
-        let mut batches = datafusion::physical_plan::execute_stream(plan, ctx.task_ctx())?;
-
-        let mut rows = 0;
-
-        while let Some(batch) = batches.next().await {
-            rows += batch?.num_rows();
+impl S3ObjectStoreProvider {
+    fn new() -> Self {
+        Self {
+            region: AWS_REGION.to_string(),
         }
-
-        let elapsed = start.elapsed().as_secs_f64();
-
-        println!("Normal iteration {i}: Read {rows} rows in {elapsed}s");
     }
-
-    let elapsed = start.elapsed().as_secs_f64();
-
-    println!("Normal: 10 concurrent executions in {elapsed}s");
-
-    Ok(())
 }
 
-async fn execute_tpc_query(plan: &Arc<dyn ExecutionPlan>) -> Result<()> {
-    let registry = ObjectStoreRegistry::new();
+impl ObjectStoreProvider for S3ObjectStoreProvider {
+    fn get_by_url(&self, url: &Url) -> datafusion::common::Result<Arc<dyn ObjectStore>> {
+        if url.scheme() == "s3" {
+            if let Some(bucket) = url.host_str() {
+                // See https://github.com/hyperium/hyper/issues/2136
+                let client_options =
+                    ClientOptions::default().with_pool_idle_timeout(Duration::from_secs(15));
 
-    registry.register_store("file", "", Arc::new(AsyncFileStore::new()));
-
-    let runtime_config = RuntimeConfig::new().with_object_store_registry(Arc::new(registry));
-    let runtime = Arc::new(RuntimeEnv::new(runtime_config)?);
-
-    let config = SessionConfig::new().with_target_partitions(6);
-    let ctx = SessionContext::with_config_rt(config, runtime);
-
-    let scheduler = Arc::new(Scheduler::new_with_driver(IOUringDriver::default(), 6));
-
-    let start = Instant::now();
-    for i in 0..30 {
-        let start = Instant::now();
-
-        let mut batches = scheduler.schedule(plan.clone(), ctx.task_ctx())?.stream();
-
-        let mut rows = 0;
-
-        while let Some(batch) = batches.next().await {
-            rows += batch?.num_rows();
+                Ok(Arc::new(AmazonS3Builder::from_env()
+                    .with_bucket_name(bucket)
+                    .with_region(self.region.clone())
+                    .with_access_key_id(AWS_ACCESS_KEY)
+                    .with_secret_access_key(AWS_SECRET)
+                    .with_token(AWS_TOKEN)
+                    .with_client_options(client_options)
+                    .build()?))
+            } else {
+                Err(DataFusionError::Internal(
+                    "Cannot resolve S3 object store, missing bucket".to_owned(),
+                ))
+            }
+        } else {
+            Err(DataFusionError::Internal(
+                "Cannot resolve S3 object store, invalid URL scheme".to_owned(),
+            ))
         }
-
-        let elapsed = start.elapsed().as_secs_f64();
-
-        println!("TPC iteration {i}: Read {rows} rows in {elapsed}s");
     }
-    let elapsed = start.elapsed().as_secs_f64();
-
-    println!("Normal: 10 concurrent executions in {elapsed}s");
-
-    Ok(())
 }

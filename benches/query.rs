@@ -13,7 +13,7 @@ use datafusion::prelude::SessionConfig;
 use datafusion::prelude::SessionContext;
 use datafusion::scheduler::Scheduler;
 use datafusion_tpc::driver::IOUringDriver;
-use datafusion_tpc::object_store::file::AsyncFileStore;
+use datafusion_tpc::object_store::async_file::AsyncFileStore;
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 use tokio::runtime::Builder;
